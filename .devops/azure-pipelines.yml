@@ -1,0 +1,53 @@
+trigger:
+  branches:
+    include:
+      - Dev
+      - UAT
+      - Main
+  paths:
+    include:
+      - app.json
+
+pool:
+  name: BC-SelfHosted
+
+variables:
+  - group: BC-Pipeline-Variables
+  # ── 'true'  → Download symbols from Microsoft NuGet feed (BC28) ──
+  # ── 'false' → Restore from Azure DevOps Cache (fallback)        ──
+  - name: useNuGetSymbols
+    value: "true"
+
+stages:
+  - stage: Build
+    displayName: "Build AL App"
+    jobs:
+      - job: BuildJob
+        displayName: "Compile .app file"
+        steps:
+          - checkout: self
+            displayName: "Checkout Code"
+          - template: templates/sync-alc.yml
+          - template: templates/download-symbols.yml
+          - template: templates/compile.yml
+
+  - stage: Deploy
+    displayName: "Deploy to BC Environment"
+    dependsOn: Build
+    variables:
+      appPublisher: $[ stageDependencies.Build.BuildJob.outputs['CompileStep.appPublisher'] ]
+      appName: $[ stageDependencies.Build.BuildJob.outputs['CompileStep.appName'] ]
+      appVersion: $[ stageDependencies.Build.BuildJob.outputs['CompileStep.appVersion'] ]
+      appId: $[ stageDependencies.Build.BuildJob.outputs['CompileStep.appId'] ]
+    jobs:
+      - job: DeployJob
+        displayName: "Deploy .app to BC"
+        steps:
+          - checkout: none
+
+          - template: templates/deploy.yml
+            parameters:
+              appPublisher: "$(appPublisher)"
+              appName: "$(appName)"
+              appVersion: "$(appVersion)"
+              appId: "$(appId)"

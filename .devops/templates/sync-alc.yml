@@ -1,0 +1,133 @@
+steps:
+  - task: PowerShell@2
+    displayName: "Sync Latest alc.exe to C: ALCompiler"
+    inputs:
+      targetType: "inline"
+      script: |
+        Write-Host "=== Syncing latest alc.exe to C:\ALCompiler ==="
+        Write-Host "Agent running as : $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+        Write-Host "USERPROFILE      : $env:USERPROFILE"
+
+        # ── Auto-discover all user profiles that have the AL extension installed ──
+        # Scans C:\Users for any profile containing ms-dynamics-smb.al-* extension folder.
+        # Silently skips profiles the agent cannot read (no hardcoded usernames).
+        $searchRoots = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+          Where-Object {
+            $extPath = "$($_.FullName)\.vscode\extensions"
+            (Test-Path $extPath) -and
+            (Get-ChildItem $extPath -Filter "ms-dynamics-smb.al-*" -Directory -ErrorAction SilentlyContinue)
+          } |
+          ForEach-Object { "$($_.FullName)\.vscode\extensions" }
+
+        if (-not $searchRoots) {
+          Write-Error "No user profile found with the AL extension (ms-dynamics-smb.al-*) installed under C:\Users!"
+          exit 1
+        }
+
+        Write-Host "AL extension found in profile(s):"
+        $searchRoots | ForEach-Object { Write-Host "  $_" }
+
+        # ── Find all alc.exe binaries across discovered roots ────────────────
+        $allAlcExes = $searchRoots | ForEach-Object {
+          Get-ChildItem -Path $_ -Filter "alc.exe" -Recurse -ErrorAction SilentlyContinue
+        } | ForEach-Object {
+          $v = (Get-Item $_.FullName -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+          if (-not $v) { return }
+          [PSCustomObject]@{
+            FullName    = $_.FullName
+            Directory   = $_.DirectoryName
+            FileVersion = $v
+            Major       = [int]($v -split '\.')[0]
+            Minor       = [int]($v -split '\.')[1]
+            Build       = [int]($v -split '\.')[2]
+            Revision    = [int]($v -split '\.')[3]
+          }
+        } | Sort-Object Major, Minor, Build, Revision -Descending
+
+        if (-not $allAlcExes) {
+          Write-Error "AL extension folder found but no alc.exe detected inside it!"
+          exit 1
+        }
+
+        Write-Host ""
+        Write-Host "All detected alc.exe versions:"
+        $allAlcExes | ForEach-Object { Write-Host "  v$($_.FileVersion) → $($_.FullName)" }
+
+        $best         = $allAlcExes | Select-Object -First 1
+        $bestVersion  = $best.FileVersion
+        $bestSrcDir   = $best.Directory        # e.g. ...\bin\win32
+        $binDir       = Split-Path $bestSrcDir  # e.g. ...\bin
+        $dst          = "C:\ALCompiler"
+        $currentAlc   = "$dst\alc.exe"
+        $srcAnalyzers = Join-Path $binDir "Analyzers"
+        $dstAnalyzers = "$dst\Analyzers"
+
+        Write-Host ""
+        Write-Host "Latest version found : v$bestVersion"
+        Write-Host "Source folder        : $bestSrcDir"
+        Write-Host "Bin folder           : $binDir"
+
+        # ── Track whether compiler version changed ───────────────────────────
+        $versionChanged = $false
+
+        if (Test-Path $currentAlc) {
+          $currentVersion = (Get-Item $currentAlc).VersionInfo.FileVersion
+          Write-Host "Current C:\ALCompiler : v$currentVersion"
+
+          if ($currentVersion -eq $bestVersion) {
+            Write-Host "✅ Compiler already up to date (v$currentVersion). Skipping compiler sync."
+          } else {
+            Write-Host "Upgrade needed: v$currentVersion → v$bestVersion"
+            $versionChanged = $true
+
+            $backupPath = "C:\ALCompiler_backup_v$currentVersion"
+            Write-Host "Backing up to $backupPath ..."
+            if (Test-Path $backupPath) { Remove-Item $backupPath -Recurse -Force }
+            Copy-Item -Path $dst -Destination $backupPath -Recurse -Force
+            Write-Host "Backup created."
+
+            Write-Host "Copying v$bestVersion compiler files to $dst ..."
+            New-Item -ItemType Directory -Path $dst -Force | Out-Null
+            Copy-Item -Path "$bestSrcDir\*" -Destination $dst -Recurse -Force
+
+            $verifyVersion = (Get-Item $currentAlc).VersionInfo.FileVersion
+            if ($verifyVersion -eq $bestVersion) {
+              Write-Host "✅ Compiler sync complete! C:\ALCompiler is now v$verifyVersion"
+            } else {
+              Write-Error "Sync verification failed. Expected v$bestVersion but got v$verifyVersion"
+              exit 1
+            }
+          }
+        } else {
+          Write-Host "C:\ALCompiler\alc.exe not found. Fresh install will be performed."
+          $versionChanged = $true
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          Copy-Item -Path "$bestSrcDir\*" -Destination $dst -Recurse -Force
+          Write-Host "✅ Fresh install complete! C:\ALCompiler is now v$bestVersion"
+        }
+
+        # ── Analyzers sync ───────────────────────────────────────────────────
+        Write-Host ""
+        Write-Host "Checking Analyzers folder..."
+
+        if (Test-Path $srcAnalyzers) {
+          if ($versionChanged) {
+            # Compiler was upgraded or fresh install — always refresh Analyzers
+            Write-Host "Compiler version changed — refreshing Analyzers to match v$bestVersion..."
+            if (Test-Path $dstAnalyzers) { Remove-Item $dstAnalyzers -Recurse -Force }
+            Copy-Item -Path $srcAnalyzers -Destination $dstAnalyzers -Recurse -Force
+            Write-Host "✅ Analyzers refreshed to match v$bestVersion"
+          } elseif (-not (Test-Path $dstAnalyzers)) {
+            # Compiler unchanged but Analyzers missing (e.g. manually deleted)
+            Write-Host "Analyzers missing — copying now..."
+            Copy-Item -Path $srcAnalyzers -Destination $dstAnalyzers -Recurse -Force
+            Write-Host "✅ Analyzers copied to $dstAnalyzers"
+          } else {
+            Write-Host "✅ Analyzers already present and compiler unchanged. Skipping."
+          }
+        } else {
+          Write-Warning "⚠️ Analyzers source not found at $srcAnalyzers — skipping."
+        }
+
+        Write-Host ""
+        Write-Host "🎉 Sync step complete!"

@@ -1,0 +1,188 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - Dev
+      - UAT
+      - Main
+  paths:
+    include:
+      - src
+      - app.json
+
+pool:
+  name: BC-SelfHosted
+
+variables:
+  - group: BC-Pipeline-Variables
+  - name: useNuGetSymbols
+    value: "true"
+
+stages:
+  - stage: PRValidation
+    displayName: "PR Validation - Build & Code Analysis"
+    jobs:
+      - job: ValidateJob
+        displayName: "Compile & Analyse AL Code"
+        steps:
+          - checkout: self
+            displayName: "Checkout Code"
+
+          # ── Reuse existing templates ──────────────────────────────────────
+          - template: templates/sync-alc.yml
+
+          - template: templates/download-symbols.yml
+
+          # ── Compile + Full Code Analysis ──────────────────────────────────
+          - task: PowerShell@2
+            displayName: "Compile & Run AL Code Analysis"
+            env:
+              PR_SOURCE_BRANCH: $(System.PullRequest.SourceBranch)
+              PR_TARGET_BRANCH: $(System.PullRequest.TargetBranch)
+              PR_ID: $(System.PullRequest.PullRequestId)
+            inputs:
+              targetType: "inline"
+              script: |
+                Write-Host "PR Validation Started..."
+                Write-Host "Source Branch : $env:PR_SOURCE_BRANCH"
+                Write-Host "Target Branch : $env:PR_TARGET_BRANCH"
+                Write-Host "PR ID         : $env:PR_ID"
+
+                # ── Locate alc.exe ───────────────────────────────────────────
+                Write-Host "Auto detecting alc.exe..."
+                $alcExe = Get-ChildItem -Path "C:\ALCompiler" -Filter "alc.exe" -Recurse -ErrorAction SilentlyContinue |
+                          Sort-Object LastWriteTime -Descending |
+                          Select-Object -First 1 -ExpandProperty FullName
+
+                if (-not $alcExe) {
+                  Write-Host "Not found in C:\ALCompiler. Searching VS Code extensions..."
+                  $alcExe = Get-ChildItem -Path "$env:USERPROFILE\.vscode\extensions" -Filter "alc.exe" -Recurse -ErrorAction SilentlyContinue |
+                            Sort-Object LastWriteTime -Descending |
+                            Select-Object -First 1 -ExpandProperty FullName
+                }
+
+                if (-not $alcExe) {
+                  Write-Error "alc.exe not found on this machine!"
+                  exit 1
+                }
+                Write-Host "Found alc.exe: $alcExe"
+
+                # ── Locate Analyzers ─────────────────────────────────────────
+                Write-Host "Auto detecting Analyzers folder..."
+
+                $candidatePaths = @(
+                  "C:\ALCompiler\Analyzers",
+                  (Join-Path (Split-Path $alcExe) "Analyzers"),
+                  (Join-Path (Split-Path (Split-Path $alcExe)) "Analyzers")
+                )
+
+                $analyzersFolder = $null
+                foreach ($path in $candidatePaths) {
+                  if (Test-Path $path) {
+                    $analyzersFolder = $path
+                    break
+                  }
+                }
+
+                if (-not $analyzersFolder) {
+                  Write-Host "Searching VS Code extensions for highest version Analyzers..."
+                  $analyzersFolder = Get-ChildItem "C:\Users" -Directory | ForEach-Object {
+                    Get-ChildItem -Path "$($_.FullName)\.vscode\extensions" -Filter "Analyzers" -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSIsContainer }
+                  } | ForEach-Object {
+                    $alcPath = Join-Path $_.FullName "..\alc.exe"
+                    $alcItem = Get-Item $alcPath -ErrorAction SilentlyContinue
+                    $v = if ($alcItem) { $alcItem.VersionInfo.FileVersion } else { $null }
+                    [PSCustomObject]@{ Path = $_.FullName; Version = $v }
+                  } | Where-Object { $_.Version } |
+                    Sort-Object Version -Descending |
+                    Select-Object -First 1 -ExpandProperty Path
+                }
+
+                if (-not $analyzersFolder) {
+                  Write-Error "Analyzers folder not found!"
+                  exit 1
+                }
+                Write-Host "Found Analyzers: $analyzersFolder"
+
+                $codeCopDll = Join-Path $analyzersFolder "Microsoft.Dynamics.Nav.CodeCop.dll"
+                $uiCopDll   = Join-Path $analyzersFolder "Microsoft.Dynamics.Nav.UICop.dll"
+                $pteCopDll  = Join-Path $analyzersFolder "Microsoft.Dynamics.Nav.PerTenantExtensionCop.dll"
+
+                # ── Project paths ────────────────────────────────────────────
+                $projectFolder   = "$(Build.SourcesDirectory)"
+                $packageCache    = "$projectFolder\.alpackages"
+                $appJson         = Get-Content "$projectFolder\app.json" | ConvertFrom-Json
+
+                Write-Host "Validating: $($appJson.publisher) - $($appJson.name) v$($appJson.version)"
+
+                $outputFolder    = "$projectFolder\output"
+                $appFileName     = "$($appJson.publisher)_$($appJson.name)_$($appJson.version).app"
+                $outputFile      = "$outputFolder\$appFileName"
+                $analysisLogFile = "$outputFolder\CodeAnalysis.txt"
+
+                New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
+
+                # ── Build alc.exe arguments ──────────────────────────────────
+                $alcArgs = @(
+                  "/project:$projectFolder",
+                  "/packagecachepath:$packageCache",
+                  "/out:$outputFile"
+                )
+
+                if (Test-Path $codeCopDll) {
+                  $alcArgs += "/analyzer:$codeCopDll"
+                  Write-Host "✅ CodeCop enabled"
+                }
+                if (Test-Path $uiCopDll) {
+                  $alcArgs += "/analyzer:$uiCopDll"
+                  Write-Host "✅ UICop enabled"
+                }
+                if (Test-Path $pteCopDll) {
+                  $alcArgs += "/analyzer:$pteCopDll"
+                  Write-Host "✅ PerTenantExtensionCop enabled"
+                }
+
+                # ── Run compilation + analysis ───────────────────────────────
+                Write-Host "Running AL Compilation + Code Analysis..."
+                $output = & "$alcExe" @alcArgs 2>&1
+                $output | Out-File -FilePath $analysisLogFile -Encoding UTF8
+                $output | ForEach-Object { Write-Host $_ }
+
+                # ── Parse results ────────────────────────────────────────────
+                $errors   = $output | Where-Object { $_ -match "\berror\b" }
+                $warnings = $output | Where-Object { $_ -match "\bwarning\b" }
+
+                Write-Host "=========================================="
+                Write-Host "AL Code Analysis Summary"
+                Write-Host "=========================================="
+                Write-Host "Total Errors  : $($errors.Count)"
+                Write-Host "Total Warnings: $($warnings.Count)"
+                Write-Host "=========================================="
+
+                if ($warnings.Count -gt 0) {
+                  Write-Host "⚠️ WARNINGS FOUND:"
+                  $warnings | ForEach-Object { Write-Host "  $_" }
+                }
+
+                if ($errors.Count -gt 0) {
+                  Write-Host "❌ ERRORS FOUND - PR cannot be merged!"
+                  $errors | ForEach-Object { Write-Host "  $_" }
+                  exit 1
+                }
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Error "❌ Compilation failed! Fix all errors before merging."
+                  exit 1
+                }
+
+                Write-Host "✅ PR Validation Passed! Code is safe to merge."
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Code Analysis Report"
+            condition: always()
+            inputs:
+              PathtoPublish: '$(Build.SourcesDirectory)\output'
+              ArtifactName: "CodeAnalysisReport"
+              publishLocation: "Container"

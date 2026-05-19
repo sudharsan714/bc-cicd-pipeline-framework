@@ -1,0 +1,267 @@
+parameters:
+  - name: appPublisher
+    type: string
+  - name: appName
+    type: string
+  - name: appVersion
+    type: string
+  - name: appId
+    type: string
+
+steps:
+  - task: DownloadBuildArtifacts@1
+    displayName: "Download .app Artifact"
+    inputs:
+      buildType: "current"
+      downloadType: "single"
+      artifactName: "BCApp"
+      downloadPath: "$(System.ArtifactsDirectory)"
+
+  - task: PowerShell@2
+    displayName: "Deploy to BC Environment"
+    inputs:
+      targetType: "inline"
+      script: |
+        $branch = "$(Build.SourceBranchName)"
+        Write-Host "Branch: $branch"
+
+        switch ($branch) {
+          "Dev"  { $environmentName = "$(BC_ENV_DEV)" }
+          "UAT"  { $environmentName = "$(BC_ENV_UAT)" }
+          "Main" { $environmentName = "$(BC_ENV_MAIN)" }
+          default {
+            Write-Error "Unknown branch: $branch. No environment mapped."
+            exit 1
+          }
+        }
+
+        # ADD THIS GUARD ↓
+        if ([string]::IsNullOrWhiteSpace($environmentName) -or $environmentName -like "*`$(*)*") {
+        Write-Error "❌ Environment variable for branch '$branch' is empty or unresolved. Check BC-Pipeline-Variables variable group."
+        exit 1 }
+
+        Write-Host "Target BC Environment: $environmentName"
+        Write-Host "App Publisher : ${{ parameters.appPublisher }}"
+        Write-Host "App Name      : ${{ parameters.appName }}"
+        Write-Host "App Version   : ${{ parameters.appVersion }}"
+        Write-Host "App ID        : ${{ parameters.appId }}"
+
+        $appFile = Get-ChildItem -Path "$(System.ArtifactsDirectory)\BCApp" -Filter "*.app" | Select-Object -First 1
+        if (-not $appFile) {
+          Write-Error "No .app file found in artifact!"
+          exit 1
+        }
+        Write-Host "App File: $($appFile.FullName)"
+
+        # ── Acquire access token ─────────────────────────────────────────────
+        $tokenUrl  = "https://login.microsoftonline.com/$(BC_TENANT_ID)/oauth2/v2.0/token"
+        $tokenBody = @{
+          grant_type    = "client_credentials"
+          client_id     = "$(BC_CLIENT_ID)"
+          client_secret = "$(BC_CLIENT_SECRET)"
+          scope         = "https://api.businesscentral.dynamics.com/.default"
+        }
+        $tokenResponse = Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $tokenBody
+        $accessToken   = $tokenResponse.access_token
+        Write-Host "Token acquired!"
+
+        # ── Setup base URL ───────────────────────────────────────────────────
+        $tenantId  = "$(BC_ENV_TENANT_ID)"
+        $companyId = "$(BC_COMPANY_ID)"
+
+        Write-Host "Tenant ID  : $tenantId"
+        Write-Host "Company ID : $companyId"
+        Write-Host "Environment: $environmentName"
+
+        if ([string]::IsNullOrEmpty($tenantId)) {
+          Write-Error "❌ BC_ENV_TENANT_ID is empty! Ensure it is defined in BC-Pipeline-Variables variable group."
+          exit 1
+        }
+
+        $baseUrl       = "https://api.businesscentral.dynamics.com/v2.0/$tenantId/$environmentName/api/microsoft/automation/v2.0"
+        $extensionsUrl = "$baseUrl/companies($companyId)/extensions"
+        $expectedVersion = "${{ parameters.appVersion }}"
+
+        Write-Host "Base URL   : $baseUrl"
+
+        # ── Pre-flight: check if version is already installed ────────────────
+        Write-Host "Checking if version $expectedVersion is already installed..."
+        $extensions = Invoke-RestMethod -Method Get -Uri $extensionsUrl -Headers @{ Authorization = "Bearer $accessToken" }
+
+        $alreadyInstalled = $extensions.value | Where-Object {
+          $_.publisher   -eq "${{ parameters.appPublisher }}" -and
+          $_.displayName -eq "${{ parameters.appName }}"      -and
+          $_.isInstalled -eq $true                             -and
+          "$($_.versionMajor).$($_.versionMinor).$($_.versionBuild).$($_.versionRevision)" -eq $expectedVersion
+        } | Select-Object -First 1
+
+        if ($alreadyInstalled) {
+          Write-Error "❌ BC Deployment Error: An extension with app Id '${{ parameters.appId }}' and version '$expectedVersion' is already installed in '$environmentName'. Please increment the app version in app.json before deploying."
+          exit 1
+        }
+        Write-Host "✅ Version check passed. Proceeding with deployment..."
+
+        # ── Upload .app via BC Automation API ────────────────────────────────
+        $getUrl          = "$baseUrl/companies($companyId)/extensionUpload"
+        $existingRecords = Invoke-RestMethod -Method Get -Uri $getUrl -Headers @{ Authorization = "Bearer $accessToken" }
+
+        if ($existingRecords.value.Count -eq 0) {
+          Write-Host "No record found. Creating new record..."
+          $postHeaders = @{
+            Authorization  = "Bearer $accessToken"
+            "Content-Type" = "application/json"
+          }
+          $body = @{ systemId = "00000000-0000-0000-0000-000000000000" } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri $getUrl -Headers $postHeaders -Body $body | Out-Null
+          $existingRecords = Invoke-RestMethod -Method Get -Uri $getUrl -Headers @{ Authorization = "Bearer $accessToken" }
+          Write-Host "New record created and fetched!"
+        }
+
+        $record     = $existingRecords.value[0]
+        $etag       = $record.'@odata.etag'
+        $contentUrl = $record.'extensionContent@odata.mediaEditLink'
+        $systemId   = $record.systemId
+
+        Write-Host "SystemId: $systemId"
+        Write-Host "ETag    : $etag"
+
+        $appBytes     = [System.IO.File]::ReadAllBytes($appFile.FullName)
+        $patchHeaders = @{
+          Authorization  = "Bearer $accessToken"
+          "Content-Type" = "application/octet-stream"
+          "If-Match"     = $etag
+        }
+        Invoke-RestMethod -Method Patch -Uri $contentUrl -Headers $patchHeaders -Body $appBytes
+        Write-Host "Upload successful!"
+
+        # ── Trigger deployment ───────────────────────────────────────────────
+        $deployUrl = "$baseUrl/companies($companyId)/extensionUpload($systemId)/Microsoft.NAV.upload"
+        try {
+          Invoke-RestMethod -Method Post -Uri $deployUrl -Headers @{ Authorization = "Bearer $accessToken" }
+          Write-Host "Deployment triggered! Polling for status..."
+        } catch {
+          $rawError  = $_.ErrorDetails.Message
+          $bcMessage = $null
+
+          if ($rawError) {
+            try {
+              $errObj    = $rawError | ConvertFrom-Json
+              $bcMessage = $errObj.error.message
+            } catch {
+              $bcMessage = $rawError
+            }
+          }
+
+          if (-not $bcMessage) { $bcMessage = $_.Exception.Message }
+
+          Write-Error "❌ BC Deployment Error: $bcMessage"
+          exit 1
+        }
+
+        # ── Poll until deployed ──────────────────────────────────────────────
+        $maxRetries    = 20
+        $retryCount    = 0
+        $deploySuccess = $false
+        $deployStatusUrl = "$baseUrl/companies($companyId)/extensionDeploymentStatus"
+
+        do {
+          Start-Sleep -Seconds 15
+          $retryCount++
+          Write-Host "Polling attempt $retryCount of $maxRetries..."
+
+          # ── Check deployment status for failures ─────────────────────────
+          $deployStatuses = Invoke-RestMethod -Method Get -Uri $deployStatusUrl -Headers @{ Authorization = "Bearer $accessToken" }
+          $ourStatus = $deployStatuses.value | Where-Object {
+            $_.publisher -eq "${{ parameters.appPublisher }}" -and
+            $_.name      -eq "${{ parameters.appName }}"
+          } | Sort-Object startedOn -Descending | Select-Object -First 1
+
+          if ($ourStatus) {
+            $status = $ourStatus.status
+            Write-Host "Deployment status: $status"
+
+            if ($status -eq "Failed") {
+              $operationId = $ourStatus.operationID
+
+              # ── Fetch detailed error from BC operation endpoint ─────────
+              $errMsg = $null
+              try {
+                $opUrl    = "$baseUrl/companies($companyId)/extensionDeploymentStatus($operationId)"
+                $opDetail = Invoke-RestMethod -Method Get -Uri $opUrl -Headers @{ Authorization = "Bearer $accessToken" }
+                $errMsg   = $opDetail.description
+                if ([string]::IsNullOrEmpty($errMsg)) { $errMsg = $opDetail.message }
+                if ([string]::IsNullOrEmpty($errMsg)) { $errMsg = $opDetail.errorMessage }
+              } catch {
+                Write-Host "Could not fetch operation detail: $($_.Exception.Message)"
+              }
+
+              if ([string]::IsNullOrEmpty($errMsg)) {
+                $errMsg = "Extension '${{ parameters.appName }}' v$($ourStatus.appVersion) by '${{ parameters.appPublisher }}' failed to deploy in '$environmentName'.`n" +
+                          "Operation ID : $operationId`n" +
+                          "Operation Type: $($ourStatus.operationType)`n" +
+                          "Started On   : $($ourStatus.startedOn)`n" +
+                          "➡️ Check BC Admin Center → '$environmentName' → Extensions for full error details."
+              }
+
+              Write-Host "##vso[task.logissue type=error]❌ BC Deployment Failed: $errMsg"
+              Write-Host "##vso[task.complete result=Failed]"
+              exit 1
+            }
+          }
+
+          # ── Check installed version ──────────────────────────────────────
+          $extensions = Invoke-RestMethod -Method Get -Uri $extensionsUrl -Headers @{ Authorization = "Bearer $accessToken" }
+
+          $ourApp = $extensions.value | Where-Object {
+            $_.publisher   -eq "${{ parameters.appPublisher }}" -and
+            $_.displayName -eq "${{ parameters.appName }}"      -and
+            $_.isInstalled -eq $true
+          } | Select-Object -First 1
+
+          if ($ourApp) {
+            $installedVersion = "$($ourApp.versionMajor).$($ourApp.versionMinor).$($ourApp.versionBuild).$($ourApp.versionRevision)"
+            Write-Host "Found installed version: $installedVersion | Expected: $expectedVersion"
+
+            if ($installedVersion -eq $expectedVersion) {
+              $deploySuccess = $true
+              Write-Host "✅ Deployment successful! Version $installedVersion is installed in $environmentName"
+              break
+            } else {
+              Write-Host "Version mismatch - old version still active. Waiting..."
+            }
+          } else {
+            Write-Host "App not found yet - still deploying..."
+          }
+        } while ($retryCount -lt $maxRetries)
+
+        if (-not $deploySuccess) {
+          Write-Error "❌ Deployment did not complete within expected time. Please check BC environment manually."
+          exit 1
+        }
+
+        # ── Cleanup older unpublished versions ───────────────────────────────
+        Write-Host "Starting cleanup of older versions..."
+        $allExtensions = Invoke-RestMethod -Method Get -Uri $extensionsUrl -Headers @{ Authorization = "Bearer $accessToken" }
+
+        $olderVersions = $allExtensions.value | Where-Object {
+          $_.id          -eq "${{ parameters.appId }}" -and
+          $_.isInstalled -eq $false                     -and
+          "$($_.versionMajor).$($_.versionMinor).$($_.versionBuild).$($_.versionRevision)" -ne $expectedVersion
+        }
+
+        if ($olderVersions.Count -eq 0) {
+          Write-Host "No older versions found to unpublish."
+        } else {
+          foreach ($oldApp in $olderVersions) {
+            $oldVersion = "$($oldApp.versionMajor).$($oldApp.versionMinor).$($oldApp.versionBuild).$($oldApp.versionRevision)"
+            Write-Host "Unpublishing old version: $oldVersion (packageId: $($oldApp.packageId))"
+            try {
+              $unpublishUrl = "$baseUrl/companies($companyId)/extensions($($oldApp.packageId))/Microsoft.NAV.unpublish"
+              Invoke-RestMethod -Method Post -Uri $unpublishUrl -Headers @{ Authorization = "Bearer $accessToken" }
+              Write-Host "✅ Unpublished version $oldVersion successfully!"
+            } catch {
+              Write-Host "⚠️ Warning: Could not unpublish version $oldVersion - $($_.Exception.Message)"
+            }
+          }
+        }
+        Write-Host "🎉 Pipeline completed successfully!"

@@ -1,0 +1,277 @@
+steps:
+  # ── Fallback: restore from Azure DevOps cache ──────────────────────────────
+  - task: Cache@2
+    displayName: "Restore AL Packages Cache (fallback)"
+    condition: eq(variables['useNuGetSymbols'], 'false')
+    inputs:
+      key: 'alpackages | "$(Agent.OS)" | $(Build.SourcesDirectory)/app.json'
+      restoreKeys: |
+        alpackages | "$(Agent.OS)"
+      path: '$(Build.SourcesDirectory)\.alpackages'
+
+  # ── BC28: download Microsoft symbols from NuGet ────────────────────────────
+  - task: NuGetToolInstaller@1
+    displayName: "Install NuGet CLI"
+    condition: eq(variables['useNuGetSymbols'], 'true')
+    inputs:
+      versionSpec: "6.x"
+
+  - task: PowerShell@2
+    displayName: "Download AL Symbols from Global NuGet (BC28)"
+    condition: eq(variables['useNuGetSymbols'], 'true')
+    inputs:
+      targetType: "inline"
+      script: |
+        Write-Host "=== Downloading AL Symbols from Microsoft Global NuGet Feed ==="
+
+        $projectFolder = "$(Build.SourcesDirectory)"
+        $packageCache  = "$projectFolder\.alpackages"
+        $appJson       = Get-Content "$projectFolder\app.json" | ConvertFrom-Json
+        $countryRegion = "$(BC_SYMBOLS_COUNTRY_REGION)".ToLower()
+        $bcVersion     = $appJson.application
+        $bcMajor       = ([version]$bcVersion).Major
+
+        Write-Host "BC App Version  : $bcVersion (major: $bcMajor)"
+        Write-Host "Country / Region: $countryRegion"
+        Write-Host "Package Cache   : $packageCache"
+
+        New-Item -ItemType Directory -Path $packageCache -Force | Out-Null
+
+        # ── Locate nuget.exe ─────────────────────────────────────────────────
+        $nugetCmd = Get-Command nuget -ErrorAction SilentlyContinue
+        if ($nugetCmd) {
+          $nugetExe = $nugetCmd.Source
+        } else {
+          $nugetExe = Get-ChildItem -Path "$env:AGENT_TOOLSDIRECTORY" -Filter "nuget.exe" -Recurse -ErrorAction SilentlyContinue |
+                      Select-Object -First 1 -ExpandProperty FullName
+        }
+        if (-not $nugetExe) {
+          Write-Error "nuget.exe not found. NuGetToolInstaller@1 task should have installed it."
+          exit 1
+        }
+        Write-Host "nuget.exe: $nugetExe"
+
+        # ── Register Microsoft public MSSymbols feed ─────────────────────────
+        $msSymbolsFeed   = "https://dynamicssmb2.pkgs.visualstudio.com/DynamicsBCPublicFeeds/_packaging/MSSymbols/nuget/v3/index.json"
+        $existingSources = & $nugetExe sources list 2>&1
+        if ($existingSources -notmatch "MSSymbols") {
+          & $nugetExe source add -Name "MSSymbols" -Source $msSymbolsFeed | Out-Null
+          Write-Host "MSSymbols feed registered."
+        } else {
+          Write-Host "MSSymbols feed already registered."
+        }
+
+        # ── Download Microsoft.Application.symbols ───────────────────────────
+        $appSymbolsPkg = "Microsoft.Application.symbols"
+        Write-Host ""
+        Write-Host "Downloading: $appSymbolsPkg (v$bcVersion)"
+        & $nugetExe install $appSymbolsPkg -Version $bcVersion -OutputDirectory $packageCache -Source $msSymbolsFeed
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Warning "⚠️ Exact version not found, trying latest available..."
+          & $nugetExe install $appSymbolsPkg -OutputDirectory $packageCache -Source $msSymbolsFeed
+        }
+
+        # ── Flatten: copy all .app files into .alpackages root ───────────────
+        Write-Host ""
+        Write-Host "Flattening .app files into .alpackages root..."
+        $allAppFiles = Get-ChildItem -Path $packageCache -Filter "*.app" -Recurse -ErrorAction SilentlyContinue |
+                       Where-Object { $_.DirectoryName -ne $packageCache }
+
+        foreach ($appFile in $allAppFiles) {
+          $dest = "$packageCache\$($appFile.Name)"
+          Copy-Item -Path $appFile.FullName -Destination $dest -Force
+          Write-Host "  Copied: $($appFile.Name)"
+        }
+
+        # ── Verify ───────────────────────────────────────────────────────────
+        $downloadedCount = (Get-ChildItem -Path $packageCache -Filter "*.app" -ErrorAction SilentlyContinue |
+                            Where-Object { $_.DirectoryName -eq $packageCache }).Count
+
+        if ($downloadedCount -eq 0) {
+          Write-Error "❌ No .app files found in .alpackages root after flattening."
+          exit 1
+        }
+
+        Write-Host ""
+        Write-Host "✅ Microsoft symbols download complete. $downloadedCount package(s) in .alpackages root."
+
+  # ── Dynamic dependency resolution via BC Dev Endpoint ──────────────────────
+  # Reads app.json dependencies, skips Microsoft (handled by NuGet above),
+  # and downloads all non-Microsoft .app files directly from BC environment
+  # using the same OAuth credentials already in your variable group.
+  # No manual file management or C:\BCDependencies folder needed.
+  - task: PowerShell@2
+    displayName: "Download Non-Microsoft Dependencies via BC Dev Endpoint"
+    condition: eq(variables['useNuGetSymbols'], 'true')
+    inputs:
+      targetType: "inline"
+      script: |
+        Write-Host "=== Downloading Non-Microsoft Dependencies via BC Dev Endpoint ==="
+
+        $projectFolder = "$(Build.SourcesDirectory)"
+        $packageCache  = "$projectFolder\.alpackages"
+        $appJson       = Get-Content "$projectFolder\app.json" | ConvertFrom-Json
+
+        New-Item -ItemType Directory -Path $packageCache -Force | Out-Null
+
+        # ── Read dependencies from app.json ──────────────────────────────────
+        $dependencies = $appJson.dependencies
+        if (-not $dependencies -or $dependencies.Count -eq 0) {
+          Write-Host "No dependencies found in app.json. Skipping."
+          exit 0
+        }
+
+        Write-Host "All dependencies in app.json:"
+        $dependencies | ForEach-Object {
+          Write-Host "  - $($_.publisher) | $($_.name) | v$($_.version)"
+        }
+
+        # ── Filter out Microsoft dependencies (handled by NuGet step) ────────
+        $nonMicrosoftDeps = $dependencies | Where-Object { $_.publisher -ne "Microsoft" }
+
+        if (-not $nonMicrosoftDeps -or $nonMicrosoftDeps.Count -eq 0) {
+          Write-Host ""
+          Write-Host "All dependencies are Microsoft apps — already handled by NuGet step. Skipping."
+          exit 0
+        }
+
+        Write-Host ""
+        Write-Host "Non-Microsoft dependencies to download: $($nonMicrosoftDeps.Count)"
+        $nonMicrosoftDeps | ForEach-Object {
+          Write-Host "  - $($_.publisher) | $($_.name) | v$($_.version)"
+        }
+
+        # ── Acquire OAuth token ──────────────────────────────────────────────
+        Write-Host ""
+        Write-Host "Acquiring OAuth token..."
+        $tokenUrl  = "https://login.microsoftonline.com/$(BC_TENANT_ID)/oauth2/v2.0/token"
+        $tokenBody = @{
+          grant_type    = "client_credentials"
+          client_id     = "$(BC_CLIENT_ID)"
+          client_secret = "$(BC_CLIENT_SECRET)"
+          scope         = "https://api.businesscentral.dynamics.com/.default"
+        }
+        try {
+          $token = (Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $tokenBody).access_token
+          Write-Host "Token acquired!"
+        } catch {
+          Write-Error "Failed to acquire token: $($_.Exception.Message)"
+          exit 1
+        }
+
+        # ── Determine BC environment based on branch ─────────────────────────
+        $branch = "$(Build.SourceBranchName)"
+        switch ($branch) {
+          "Dev"  { $environment = "$(BC_ENV_DEV)" }
+          "UAT"  { $environment = "$(BC_ENV_UAT)" }
+          "Main" { $environment = "$(BC_ENV_MAIN)" }
+          default {
+            # PR validation or feature branches — use Dev environment for symbols
+            $environment = "$(BC_ENV_DEV)"
+            Write-Host "Branch '$branch' — using Dev environment for symbol download."
+          }
+        }
+
+        $tenantId = "$(BC_ENV_TENANT_ID)"
+        $devBase  = "https://api.businesscentral.dynamics.com/v2.0/$tenantId/$environment/dev"
+        $headers  = @{ Authorization = "Bearer $token" }
+
+        Write-Host "Environment : $environment"
+        Write-Host "Dev Base URL: $devBase"
+        Write-Host ""
+
+        # ── Download each non-Microsoft dependency ───────────────────────────
+        $downloaded = @()
+        $failed     = @()
+
+        foreach ($dep in $nonMicrosoftDeps) {
+          $depPublisher = $dep.publisher
+          $depName      = $dep.name
+          $depVersion   = $dep.version
+          $safeFileName = "$($depPublisher)_$($depName)_$($depVersion).app" -replace '[\\/:*?"<>|]', '_'
+          $outputFile   = "$packageCache\$safeFileName"
+
+          Write-Host "Downloading: $depPublisher - $depName v$depVersion ..."
+
+          # Skip if already present in .alpackages
+          if (Test-Path $outputFile) {
+            Write-Host "  ⏭️  Already present in .alpackages. Skipping."
+            $downloaded += "$depPublisher - $depName v$depVersion (cached)"
+            continue
+          }
+
+          # ── Attempt 1: exact version match ───────────────────────────────
+          $urlExact = "$devBase/packages" +
+            "?publisher=$([Uri]::EscapeDataString($depPublisher))" +
+            "&appName=$([Uri]::EscapeDataString($depName))" +
+            "&versionText=$([Uri]::EscapeDataString($depVersion))"
+
+          try {
+            Invoke-WebRequest -Uri $urlExact -Headers $headers -OutFile $outputFile -ErrorAction Stop
+            $fileSize = (Get-Item $outputFile).Length
+            if ($fileSize -gt 0) {
+              Write-Host "  ✅ Downloaded (exact v$depVersion) — $fileSize bytes → $safeFileName"
+              $downloaded += "$depPublisher - $depName v$depVersion"
+              continue
+            } else {
+              Remove-Item $outputFile -Force
+              throw "Empty file returned"
+            }
+          } catch {
+            Write-Host "  ⚠️  Exact version not found ($($_.Exception.Message)). Trying without version..."
+            if (Test-Path $outputFile) { Remove-Item $outputFile -Force }
+          }
+
+          # ── Attempt 2: latest available version (no version constraint) ───
+          $urlLatest = "$devBase/packages" +
+            "?publisher=$([Uri]::EscapeDataString($depPublisher))" +
+            "&appName=$([Uri]::EscapeDataString($depName))"
+
+          try {
+            Invoke-WebRequest -Uri $urlLatest -Headers $headers -OutFile $outputFile -ErrorAction Stop
+            $fileSize = (Get-Item $outputFile).Length
+            if ($fileSize -gt 0) {
+              Write-Host "  ✅ Downloaded (latest available) — $fileSize bytes → $safeFileName"
+              Write-Host "  ⚠️  Note: downloaded version may differ from app.json. Update app.json version if compile errors occur."
+              $downloaded += "$depPublisher - $depName (latest)"
+              continue
+            } else {
+              Remove-Item $outputFile -Force
+              throw "Empty file returned"
+            }
+          } catch {
+            Write-Host "  ❌ Both attempts failed: $($_.Exception.Message)"
+            if (Test-Path $outputFile) { Remove-Item $outputFile -Force }
+            $failed += "$depPublisher | $depName | v$depVersion"
+          }
+        }
+
+        # ── Summary ──────────────────────────────────────────────────────────
+        Write-Host ""
+        Write-Host "=== Dependency Download Summary ==="
+        Write-Host "Downloaded : $($downloaded.Count)"
+        $downloaded | ForEach-Object { Write-Host "  ✅ $_" }
+
+        if ($failed.Count -gt 0) {
+          Write-Host ""
+          Write-Host "Failed     : $($failed.Count)"
+          $failed | ForEach-Object { Write-Host "  ❌ $_" }
+          Write-Host ""
+          Write-Host "Possible reasons:"
+          Write-Host "  1. Extension not installed/published in environment: $environment"
+          Write-Host "  2. Publisher name in app.json does not exactly match BC"
+          Write-Host "  3. App is unpublished or inactive in BC"
+          exit 1
+        }
+
+        # ── Final .alpackages contents ────────────────────────────────────────
+        Write-Host ""
+        $totalApps = (Get-ChildItem -Path $packageCache -Filter "*.app" |
+                      Where-Object { $_.DirectoryName -eq $packageCache }).Count
+        Write-Host "Total .app files in .alpackages: $totalApps"
+        Write-Host ""
+        Write-Host "Final .alpackages contents:"
+        Get-ChildItem -Path $packageCache -Filter "*.app" |
+          Where-Object { $_.DirectoryName -eq $packageCache } |
+          ForEach-Object { Write-Host "  $($_.Name)" }

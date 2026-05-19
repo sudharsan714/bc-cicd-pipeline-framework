@@ -1,0 +1,58 @@
+steps:
+  - task: PowerShell@2
+    displayName: "Compile AL App using alc.exe"
+    name: CompileStep
+    inputs:
+      targetType: "inline"
+      script: |
+        Write-Host "Auto detecting alc.exe..."
+        $alcExe = Get-ChildItem -Path "C:\ALCompiler" -Filter "alc.exe" -Recurse -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending |
+                  Select-Object -First 1 -ExpandProperty FullName
+
+        if (-not $alcExe) {
+          Write-Host "Not found in C:\ALCompiler. Searching VS Code extensions..."
+          $alcExe = Get-ChildItem -Path "$env:USERPROFILE\.vscode\extensions" -Filter "alc.exe" -Recurse -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 1 -ExpandProperty FullName
+        }
+
+        if (-not $alcExe) {
+          Write-Error "alc.exe not found on this machine!"
+          exit 1
+        }
+
+        Write-Host "Found alc.exe: $alcExe"
+
+        $projectFolder = "$(Build.SourcesDirectory)"
+        $packageCache  = "$projectFolder\.alpackages"
+        $appJson       = Get-Content "$projectFolder\app.json" | ConvertFrom-Json
+        $appFileName   = "$($appJson.publisher)_$($appJson.name)_$($appJson.version).app"
+        $outputFile    = "$projectFolder\output\$appFileName"
+
+        New-Item -ItemType Directory -Path "$projectFolder\output" -Force
+
+        Write-Host "Starting AL Compilation..."
+        Write-Host "Project Root: $projectFolder"
+        Write-Host "Output File : $outputFile"
+
+        & "$alcExe" /project:"$projectFolder" /packagecachepath:"$packageCache" /out:"$outputFile"
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Compilation failed!"
+          exit 1
+        }
+
+        Write-Host "Compilation successful!"
+        Write-Host "##vso[task.setvariable variable=appFilePath;isOutput=true]$outputFile"
+        Write-Host "##vso[task.setvariable variable=appPublisher;isOutput=true]$($appJson.publisher)"
+        Write-Host "##vso[task.setvariable variable=appName;isOutput=true]$($appJson.name)"
+        Write-Host "##vso[task.setvariable variable=appVersion;isOutput=true]$($appJson.version)"
+        Write-Host "##vso[task.setvariable variable=appId;isOutput=true]$($appJson.id)"
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Publish .app Artifact"
+    inputs:
+      PathtoPublish: '$(Build.SourcesDirectory)\output'
+      ArtifactName: "BCApp"
+      publishLocation: "Container"
