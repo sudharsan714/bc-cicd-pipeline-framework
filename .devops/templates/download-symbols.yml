@@ -142,39 +142,69 @@ steps:
             -Source $msSymbolsFeed
 
         if ($LASTEXITCODE -ne 0) {
-          # ── If exact 4-part version not on feed, try same Major.Minor ───────
-          # E.g. if 28.0.49765.51234 is not published yet, search for latest 28.0.x
-          $versionObj  = [version]$nugetVersion
-          $majorMinor  = "$($versionObj.Major).$($versionObj.Minor)"
-          Write-Warning "⚠️  Exact version $nugetVersion not found on MSSymbols feed."
-          Write-Warning "Searching for latest available $majorMinor.x.x package..."
+          # ── If exact 4-part version not on feed, find closest published version ──
+          # Strategy: same Major.Minor.Build, highest Revision ≤ environment revision.
+          # This avoids accidentally picking a HIGHER revision (e.g. 50526 env but feed
+          # publishes 55000 later) which could introduce API surface your runtime lacks.
+          $versionObj     = [version]$nugetVersion
+          $majorMinor     = "$($versionObj.Major).$($versionObj.Minor)"
+          $majorMinorBuild= "$($versionObj.Major).$($versionObj.Minor).$($versionObj.Build)"
+          $envRevision    = $versionObj.Revision   # e.g. 50526
 
-          # List all versions for this major.minor and pick the newest
+          Write-Warning "⚠️  Exact version $nugetVersion not found on MSSymbols feed."
+          Write-Warning "Searching for closest published version ≤ $nugetVersion ..."
+
+          # List all versions for this major.minor from the feed
           $listOutput = & $nugetExe list $appSymbolsPkg `
               -Source $msSymbolsFeed `
               -AllVersions 2>&1
 
-          $matchingVersions = $listOutput |
+          $allFeedVersions = $listOutput |
               Where-Object { $_ -match "^$appSymbolsPkg\s+$majorMinor\." } |
-              ForEach-Object { ($_ -split '\s+')[1] } |
+              ForEach-Object { ($_ -split '\s+')[1] }
+
+          Write-Host "All $majorMinor.x.x versions on feed:"
+          $allFeedVersions | ForEach-Object { Write-Host "  $_" }
+
+          # Prefer: same Major.Minor.Build, highest Revision ≤ env revision
+          $sameBuildVersions = $allFeedVersions |
+              Where-Object {
+                $v = [version]$_
+                $v.Build -eq $versionObj.Build -and $v.Revision -le $envRevision
+              } |
               Sort-Object { [version]$_ } -Descending
 
-          if ($matchingVersions) {
-            $fallbackVersion = $matchingVersions | Select-Object -First 1
-            Write-Host "Latest $majorMinor.x.x on feed: $fallbackVersion"
-            Write-Warning "Downloading fallback version $fallbackVersion — this MUST match major.minor of your environment."
-
-            & $nugetExe install $appSymbolsPkg `
-                -Version $fallbackVersion `
-                -OutputDirectory $packageCache `
-                -Source $msSymbolsFeed
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "❌ Failed to download $appSymbolsPkg even at fallback version $fallbackVersion."
-              exit 1
-            }
+          if ($sameBuildVersions) {
+            $fallbackVersion = $sameBuildVersions | Select-Object -First 1
+            Write-Host "Best match (same build, revision ≤ $envRevision): $fallbackVersion"
           } else {
-            Write-Error "❌ No $majorMinor.x.x packages found on MSSymbols feed. Verify the feed or your BC major version."
+            # Widen: any version with same Major.Minor, highest overall ≤ env version
+            Write-Warning "No same-build match found. Widening to any $majorMinor.x.x ≤ $nugetVersion ..."
+            $fallbackVersion = $allFeedVersions |
+                Where-Object { [version]$_ -le [version]$nugetVersion } |
+                Sort-Object { [version]$_ } -Descending |
+                Select-Object -First 1
+          }
+
+          if (-not $fallbackVersion) {
+            Write-Error "❌ No $majorMinor.x.x packages found on MSSymbols feed that are ≤ $nugetVersion."
+            Write-Error "Verify the feed URL or check if BC $majorMinor symbols have been published yet."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Environment version : $nugetVersion"
+          Write-Host "Fallback version    : $fallbackVersion"
+          Write-Warning "Symbols revision differs from environment ($nugetVersion vs $fallbackVersion)."
+          Write-Warning "This is safe as long as Major.Minor.Build match — which they do."
+
+          & $nugetExe install $appSymbolsPkg `
+              -Version $fallbackVersion `
+              -OutputDirectory $packageCache `
+              -Source $msSymbolsFeed
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "❌ Failed to download $appSymbolsPkg at fallback version $fallbackVersion."
             exit 1
           }
         }
