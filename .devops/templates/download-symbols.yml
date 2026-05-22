@@ -31,9 +31,9 @@ steps:
         $bcVersion     = $appJson.application
         $bcMajor       = ([version]$bcVersion).Major
 
-        Write-Host "BC App Version  : $bcVersion (major: $bcMajor)"
-        Write-Host "Country / Region: $countryRegion"
-        Write-Host "Package Cache   : $packageCache"
+        Write-Host "BC App Version (app.json) : $bcVersion (major: $bcMajor)"
+        Write-Host "Country / Region          : $countryRegion"
+        Write-Host "Package Cache             : $packageCache"
 
         New-Item -ItemType Directory -Path $packageCache -Force | Out-Null
 
@@ -51,6 +51,77 @@ steps:
         }
         Write-Host "nuget.exe: $nugetExe"
 
+        # ── Acquire OAuth token for Admin Center API ─────────────────────────
+        Write-Host ""
+        Write-Host "Acquiring OAuth token for Admin Center API..."
+        $tokenUrl  = "https://login.microsoftonline.com/$(BC_TENANT_ID)/oauth2/v2.0/token"
+        $tokenBody = @{
+          grant_type    = "client_credentials"
+          client_id     = "$(BC_CLIENT_ID)"
+          client_secret = "$(BC_CLIENT_SECRET)"
+          scope         = "https://api.businesscentral.dynamics.com/.default"
+        }
+
+        $token = $null
+        try {
+          $token = (Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $tokenBody -ErrorAction Stop).access_token
+          Write-Host "Token acquired."
+        } catch {
+          Write-Warning "Could not acquire OAuth token: $($_.Exception.Message)"
+          Write-Warning "Will fall back to app.json version for NuGet download."
+        }
+
+        # ── Determine target environment based on branch ─────────────────────
+        $branch = "$(Build.SourceBranchName)"
+        $environment = switch ($branch) {
+          "Dev"  { "$(BC_ENV_DEV)" }
+          "UAT"  { "$(BC_ENV_UAT)" }
+          "Main" { "$(BC_ENV_MAIN)" }
+          default {
+            Write-Host "Branch '$branch' — using Dev environment for symbol resolution."
+            "$(BC_ENV_DEV)"
+          }
+        }
+        Write-Host "Target environment : $environment"
+
+        # ── Query BC Admin Center API for exact environment version ──────────
+        # This returns the real deployed build version (e.g. 28.0.49765.51234)
+        # so NuGet downloads symbols that exactly match your runtime — no more
+        # silent major.1 promotions.
+        $exactVersion = $null
+
+        if ($token) {
+          $adminApiUrl = "https://api.businesscentral.dynamics.com/admin/v2.21/applications/BusinessCentral/environments/$environment"
+          $headers     = @{ Authorization = "Bearer $token" }
+
+          Write-Host ""
+          Write-Host "Querying Admin Center API: $adminApiUrl"
+          try {
+            $envDetails   = Invoke-RestMethod -Uri $adminApiUrl -Headers $headers -ErrorAction Stop
+            $exactVersion = $envDetails.applicationVersion   # e.g. "28.0.49765.51234"
+            Write-Host "Exact environment version : $exactVersion"
+          } catch {
+            Write-Warning "Admin Center API call failed: $($_.Exception.Message)"
+            Write-Warning "Response status: $($_.Exception.Response.StatusCode)"
+            Write-Warning "Falling back to app.json version."
+          }
+        }
+
+        # ── Resolve the version to use for NuGet ─────────────────────────────
+        # Priority: Admin API exact version → app.json version → fail loudly
+        if ($exactVersion) {
+          $nugetVersion = $exactVersion
+          Write-Host ""
+          Write-Host "Using EXACT environment version for NuGet : $nugetVersion"
+        } elseif ($bcVersion) {
+          $nugetVersion = $bcVersion
+          Write-Warning "Using app.json version as fallback        : $nugetVersion"
+          Write-Warning "This may not match your deployed environment. Update BC_CLIENT_ID/SECRET if Admin API fails."
+        } else {
+          Write-Error "Cannot determine BC version. Set application in app.json or fix Admin API credentials."
+          exit 1
+        }
+
         # ── Register Microsoft public MSSymbols feed ─────────────────────────
         $msSymbolsFeed   = "https://dynamicssmb2.pkgs.visualstudio.com/DynamicsBCPublicFeeds/_packaging/MSSymbols/nuget/v3/index.json"
         $existingSources = & $nugetExe sources list 2>&1
@@ -61,15 +132,51 @@ steps:
           Write-Host "MSSymbols feed already registered."
         }
 
-        # ── Download Microsoft.Application.symbols ───────────────────────────
+        # ── Download Microsoft.Application.symbols (exact version) ───────────
         $appSymbolsPkg = "Microsoft.Application.symbols"
         Write-Host ""
-        Write-Host "Downloading: $appSymbolsPkg (v$bcVersion)"
-        & $nugetExe install $appSymbolsPkg -Version $bcVersion -OutputDirectory $packageCache -Source $msSymbolsFeed
+        Write-Host "Downloading: $appSymbolsPkg v$nugetVersion"
+        & $nugetExe install $appSymbolsPkg `
+            -Version $nugetVersion `
+            -OutputDirectory $packageCache `
+            -Source $msSymbolsFeed
 
         if ($LASTEXITCODE -ne 0) {
-          Write-Warning "⚠️ Exact version not found, trying latest available..."
-          & $nugetExe install $appSymbolsPkg -OutputDirectory $packageCache -Source $msSymbolsFeed
+          # ── If exact 4-part version not on feed, try same Major.Minor ───────
+          # E.g. if 28.0.49765.51234 is not published yet, search for latest 28.0.x
+          $versionObj  = [version]$nugetVersion
+          $majorMinor  = "$($versionObj.Major).$($versionObj.Minor)"
+          Write-Warning "⚠️  Exact version $nugetVersion not found on MSSymbols feed."
+          Write-Warning "Searching for latest available $majorMinor.x.x package..."
+
+          # List all versions for this major.minor and pick the newest
+          $listOutput = & $nugetExe list $appSymbolsPkg `
+              -Source $msSymbolsFeed `
+              -AllVersions 2>&1
+
+          $matchingVersions = $listOutput |
+              Where-Object { $_ -match "^$appSymbolsPkg\s+$majorMinor\." } |
+              ForEach-Object { ($_ -split '\s+')[1] } |
+              Sort-Object { [version]$_ } -Descending
+
+          if ($matchingVersions) {
+            $fallbackVersion = $matchingVersions | Select-Object -First 1
+            Write-Host "Latest $majorMinor.x.x on feed: $fallbackVersion"
+            Write-Warning "Downloading fallback version $fallbackVersion — this MUST match major.minor of your environment."
+
+            & $nugetExe install $appSymbolsPkg `
+                -Version $fallbackVersion `
+                -OutputDirectory $packageCache `
+                -Source $msSymbolsFeed
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "❌ Failed to download $appSymbolsPkg even at fallback version $fallbackVersion."
+              exit 1
+            }
+          } else {
+            Write-Error "❌ No $majorMinor.x.x packages found on MSSymbols feed. Verify the feed or your BC major version."
+            exit 1
+          }
         }
 
         # ── Flatten: copy all .app files into .alpackages root ───────────────
